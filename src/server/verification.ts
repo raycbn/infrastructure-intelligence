@@ -1,0 +1,9 @@
+import { createHash, randomBytes } from "node:crypto";
+import { and, desc, eq } from "drizzle-orm";
+import { db } from "@/server/db";
+import { scopes, verificationChallenges } from "@/server/db/schema";
+import { safeFetch } from "./discovery/security";
+import { resolveVerificationTxt } from "./discovery/dns";
+const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+export async function createChallenge(scopeId: string, method: "dns_txt" | "http") { const token = randomBytes(24).toString("base64url"); await db.insert(verificationChallenges).values({ scopeId, method, tokenHash: hash(token), tokenPreview: token.slice(0, 6), expiresAt: new Date(Date.now() + 24 * 3600_000) }); return token; }
+export async function verifyScope(scopeId: string, domain: string, method: "dns_txt" | "http") { const [challenge] = await db.select().from(verificationChallenges).where(and(eq(verificationChallenges.scopeId, scopeId), eq(verificationChallenges.method, method))).orderBy(desc(verificationChallenges.createdAt)).limit(1); if (!challenge || challenge.expiresAt < new Date() || challenge.usedAt) return false; let values: string[] = []; if (method === "dns_txt") { const result = await resolveVerificationTxt(`_infrastructure-intelligence.${domain}`); if (result.error) throw new Error(result.error); values = result.values; } else { const response = await safeFetch(`https://${domain}/.well-known/infrastructure-intelligence-verification.txt`, domain); if (response.status >= 200 && response.status < 300) values = [(await response.text()).trim()]; } if (!values.some(value => hash(value) === challenge.tokenHash)) return false; await db.update(verificationChallenges).set({ usedAt: new Date() }).where(eq(verificationChallenges.id, challenge.id)); await db.update(scopes).set({ status: "verified", verificationMethod: method, verifiedAt: new Date(), updatedAt: new Date() }).where(eq(scopes.id, scopeId)); return true; }

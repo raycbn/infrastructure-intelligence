@@ -1,0 +1,2 @@
+ALTER TABLE "assets" ADD COLUMN "ownership" text DEFAULT 'unknown' NOT NULL;--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "assets_scope_ownership" ON "assets" USING btree ("scope_id","ownership");
