@@ -17,6 +17,6 @@ describe("worker discovery metadata", () => {
   });
 
   it("keeps historical summaries compatible when no worker context exists", () => {
-    expect(withWorkerMetadata({ candidates: 0 })).toEqual({ candidates: 0, discovery_pipeline_version: "2.2-rdap-network" });
+    expect(withWorkerMetadata({ candidates: 0 })).toEqual({ candidates: 0, discovery_pipeline_version: "2.3-technology-fingerprinting" });
   });
 });
