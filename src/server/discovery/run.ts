@@ -10,7 +10,7 @@ import { assertSafeHost, safeFetch, isInScope } from "./security";
 import { inspectTls } from "./tls";
 import { detectProviders } from "./providers";
 import { lookupRdap } from "./rdap";
-export const DISCOVERY_PIPELINE_VERSION = "2.1-ct-fallback";
+export const DISCOVERY_PIPELINE_VERSION = "2.2-rdap-network";
 export type WorkerRunContext = { workerId: string; workerStartedAt: string; workerSource: string; pipelineVersion: string };
 export function withWorkerMetadata(summary: Record<string, unknown>, context?: WorkerRunContext) {
   return { ...summary, discovery_pipeline_version: context?.pipelineVersion ?? DISCOVERY_PIPELINE_VERSION, ...(context ? { worker_id: context.workerId, worker_started_at: context.workerStartedAt, worker_source: context.workerSource } : {}) };
