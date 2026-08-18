@@ -2,28 +2,37 @@ import { eq } from "drizzle-orm";
 import { db } from "@/server/db";
 import { assetObservations, assets, discoveryRuns, scopes } from "@/server/db/schema";
 import { dnsDiscovery } from "./dns";
-import { certificateTransparency } from "./passive";
+import { certificateTransparencySources } from "./passive";
 import { assetKey, normalizeHostname, providerFor } from "./normalize";
 import { confidence } from "./confidence";
 import { markMissingEntities, observeAsset, observeRelationship } from "./store";
 import { assertSafeHost, safeFetch, isInScope } from "./security";
 import { inspectTls } from "./tls";
 import { detectProviders } from "./providers";
+export const DISCOVERY_PIPELINE_VERSION = "2.1-ct-fallback";
+export type WorkerRunContext = { workerId: string; workerStartedAt: string; workerSource: string; pipelineVersion: string };
+export function withWorkerMetadata(summary: Record<string, unknown>, context?: WorkerRunContext) {
+  return { ...summary, discovery_pipeline_version: context?.pipelineVersion ?? DISCOVERY_PIPELINE_VERSION, ...(context ? { worker_id: context.workerId, worker_started_at: context.workerStartedAt, worker_source: context.workerSource } : {}) };
+}
 
 type StageStatus = "OK" | "WARNING" | "ERROR";
 type Stage = { status: StageStatus; started_at: string; finished_at: string; duration_ms: number; source: string; count: number; warning?: string; error?: string };
 const cap = Number(process.env.DISCOVERY_MAX_HOSTS ?? 100);
 async function stage<T>(source: string, action: () => Promise<T>, count: (value: T) => number = () => 0): Promise<{ value?: T; result: Stage }> { const started = Date.now(); const startedAt = new Date(started).toISOString(); try { const value = await action(); const finished = Date.now(); return { value, result: { status: "OK", started_at: startedAt, finished_at: new Date(finished).toISOString(), duration_ms: finished - started, source, count: count(value) } }; } catch (error) { const finished = Date.now(); return { result: { status: "WARNING", started_at: startedAt, finished_at: new Date(finished).toISOString(), duration_ms: finished - started, source, count: 0, warning: error instanceof Error ? error.message : "Unknown stage error" } }; } }
 async function inspectHttp(host: string, scope: string) { for (const scheme of ["https", "http"]) { try { const response = await safeFetch(`${scheme}://${host}/`, scope, { method: "GET" }); return { scheme, status: response.status, server: response.headers.get("server"), poweredBy: response.headers.get("x-powered-by"), contentType: response.headers.get("content-type"), location: response.headers.get("location") }; } catch { /* try the other scheme */ } } throw new Error("HTTP and HTTPS inspection failed"); }
-export async function executeDiscovery(runId: string) {
+export async function executeDiscovery(runId: string, workerContext?: WorkerRunContext) {
   const [run] = await db.select().from(discoveryRuns).where(eq(discoveryRuns.id, runId)); if (!run) throw new Error("Run not found");
   const [scope] = await db.select().from(scopes).where(eq(scopes.id, run.scopeId)); if (!scope || scope.status !== "verified") throw new Error("Scope is not verified");
   const observedSince = new Date();
-  await db.update(discoveryRuns).set({ status: "running", startedAt: new Date() }).where(eq(discoveryRuns.id, runId));
+  await db.update(discoveryRuns).set({ status: "running", pipelineVersion: DISCOVERY_PIPELINE_VERSION, startedAt: new Date() }).where(eq(discoveryRuns.id, runId));
   const stages: Record<string, Stage> = {};
   const root = await observeAsset({ tenantId: run.tenantId, scopeId: scope.id, type: "domain", ownership: "in_scope", canonicalKey: assetKey("domain", scope.domain), displayName: scope.domain, source: "user_verified_scope", rawValue: scope.domain, normalizedValue: scope.domain, evidence: { verification: scope.verificationMethod }, confidence: 100, runId });
-  const ct = await stage("crt.sh", () => certificateTransparency(scope.domain), value => value.length); stages["certificate_transparency"] = ct.result; stages["subdomain_discovery"] = { ...ct.result, source: "certificate_transparency" };
-  const candidates = [...new Set([scope.domain, ...(ct.value ?? [])])].slice(0, cap); let processed = 0;
+  const ct = await stage("certificate_transparency", () => certificateTransparencySources(scope.domain), value => value.names.length); const ctSources = ct.value?.sources ?? [];
+  const ctStatus: StageStatus = ctSources.length === 0 || ctSources.every(source => source.status !== "ok") ? "ERROR" : ctSources.some(source => source.status !== "ok") ? "WARNING" : "OK";
+  stages["certificate_transparency"] = { ...ct.result, status: ctStatus, source: ctSources.map(source => source.source).join(",") || "crt_sh", count: ct.value?.names.length ?? 0, ...(ctSources.some(source => source.warning) ? { warning: ctSources.map(source => source.warning).filter(Boolean).join("; ") } : {}) };
+  stages["subdomain_discovery"] = { ...stages["certificate_transparency"], source: "certificate_transparency" };
+  const ctSummary = { status: ctStatus.toLowerCase(), primary_source: "crt_sh", fallback_source: "fallback_ct", sources_attempted: ctSources.map(source => source.source), sources_succeeded: ctSources.filter(source => source.status === "ok").map(source => source.source), primary_status: ctSources.find(source => source.source === "crt_sh")?.status ?? "failed", fallback_status: ctSources.find(source => source.source === "fallback_ct")?.status ?? "not_attempted", candidates: ct.value?.names.length ?? 0, normalized: ct.value?.names.length ?? 0, accepted: ct.value?.names.length ?? 0, warnings: ctSources.map(source => source.warning).filter(Boolean), duration_ms: ct.result.duration_ms };
+  const candidates = [...new Set([scope.domain, ...(ct.value?.names ?? [])])].slice(0, cap); let processed = 0;
   for (const candidate of candidates) {
     const host = normalizeHostname(candidate); const hostAsset = host === scope.domain ? root : await observeAsset({ tenantId: run.tenantId, scopeId: scope.id, type: "subdomain", ownership: "in_scope", canonicalKey: assetKey("subdomain", host), displayName: host, source: "certificate_transparency", rawValue: candidate, normalizedValue: host, evidence: { source: "crt.sh" }, confidence: confidence("passive"), runId });
     if (host !== scope.domain) await observeRelationship({ tenantId: run.tenantId, scopeId: scope.id, sourceAssetId: hostAsset.id, targetAssetId: root.id, type: "SUBDOMAIN_OF", source: "certificate_transparency", rawValue: candidate, normalizedValue: host, evidence: { source: "crt.sh" }, confidence: confidence("passive"), runId });
@@ -46,6 +55,6 @@ export async function executeDiscovery(runId: string) {
   const observed = await db.select({ id: assets.id, type: assets.type, ownership: assets.ownership }).from(assetObservations).innerJoin(assets, eq(assetObservations.assetId, assets.id)).where(eq(assetObservations.runId, runId));
   const unique = new Map(observed.map(item => [item.id, item]));
   const assetRows = [...unique.values()];
-  const summary = { candidates: candidates.length, processed, scopes_analyzed: 1, assets_discovered: assetRows.length, in_scope_assets: assetRows.filter(a => a.ownership === "in_scope").length, external_dependencies: assetRows.filter(a => a.ownership === "external").length, unknown_assets: assetRows.filter(a => a.ownership === "unknown").length, dns_records: assetRows.filter(a => a.type === "dns_record").length, web_services: assetRows.filter(a => a.type === "web_service").length, certificates: assetRows.filter(a => a.type === "tls_certificate").length, ip_addresses: assetRows.filter(a => a.type === "ip_address").length, stages };
-  await db.update(discoveryRuns).set({ status: finalStatus, finishedAt: new Date(), summary }).where(eq(discoveryRuns.id, runId));
+  const summary = { candidates: candidates.length, processed, scopes_analyzed: 1, assets_discovered: assetRows.length, in_scope_assets: assetRows.filter(a => a.ownership === "in_scope").length, external_dependencies: assetRows.filter(a => a.ownership === "external").length, unknown_assets: assetRows.filter(a => a.ownership === "unknown").length, dns_records: assetRows.filter(a => a.type === "dns_record").length, web_services: assetRows.filter(a => a.type === "web_service").length, certificates: assetRows.filter(a => a.type === "tls_certificate").length, ip_addresses: assetRows.filter(a => a.type === "ip_address").length, stages, certificate_transparency: ctSummary, coverage: { certificate_transparency: { status: ctSummary.status }, dns: { status: Object.entries(stages).some(([key,value]) => key.startsWith("dns_") && value.status === "WARNING") ? "warning" : "ok" }, http: { status: stages.http?.status?.toLowerCase() ?? "unknown" }, tls: { status: stages.tls?.status?.toLowerCase() ?? "unknown" } } };
+  await db.update(discoveryRuns).set({ status: finalStatus, pipelineVersion: DISCOVERY_PIPELINE_VERSION, finishedAt: new Date(), summary: withWorkerMetadata(summary, workerContext) }).where(eq(discoveryRuns.id, runId));
 }

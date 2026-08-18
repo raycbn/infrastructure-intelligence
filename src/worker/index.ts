@@ -6,15 +6,16 @@ import { resolve } from "node:path";
 dotenv.config({ path: resolve(process.cwd(), ".env.local") });
 dotenv.config({ path: resolve(process.cwd(), ".env") });
 
-async function tick() {
-  const [{ claimJob, finishJob }, { executeDiscovery }] = await Promise.all([
+async function tick(workerContext: { workerId: string; workerStartedAt: string; workerSource: string; pipelineVersion: string }) {
+  const [{ claimJob, finishJob }, { executeDiscovery, DISCOVERY_PIPELINE_VERSION }] = await Promise.all([
     import("@/server/jobs"),
     import("@/server/discovery/run"),
   ]);
   const job = await claimJob();
+  if (process.argv.includes("--once")) console.log(`[worker] pipeline=${DISCOVERY_PIPELINE_VERSION} cwd=${process.cwd()} source=src/server/discovery/run.ts`);
   if (!job) return false;
   try {
-    if (job.type === "discovery") await executeDiscovery(String(job.payload.runId));
+    if (job.type === "discovery") await executeDiscovery(String(job.payload.runId), workerContext);
     else throw new Error("Unsupported job type");
     await finishJob(job.id);
   } catch (error) {
@@ -24,8 +25,18 @@ async function tick() {
 }
 
 async function main() {
-  if (process.argv.includes("--once")) { await tick(); process.exit(0); }
-  while (true) { if (!await tick()) await new Promise(resolve => setTimeout(resolve, 2_000)); }
+  const { DISCOVERY_PIPELINE_VERSION } = await import("@/server/discovery/run");
+  const { acquireWorkerLock, releaseWorkerLock } = await import("@/server/worker-lock");
+  const lock = await acquireWorkerLock();
+  if (!lock) { console.error("Another Infrastructure Intelligence worker is already running."); process.exitCode = 1; return; }
+  const workerContext = { workerId: lock.workerId, workerStartedAt: lock.startedAt, workerSource: "src/server/discovery/run.ts", pipelineVersion: DISCOVERY_PIPELINE_VERSION };
+  console.log(`[worker] worker_id=${lock.workerId} pipeline=${DISCOVERY_PIPELINE_VERSION} started_at=${lock.startedAt} cwd=${process.cwd()}`);
+  const shutdown = () => { void releaseWorkerLock(lock); };
+  process.once("SIGINT", shutdown); process.once("SIGTERM", shutdown);
+  try {
+    if (process.argv.includes("--once")) { await tick(workerContext); return; }
+    while (true) { if (!await tick(workerContext)) await new Promise(resolve => setTimeout(resolve, 2_000)); }
+  } finally { await releaseWorkerLock(lock); }
 }
 
 main();
